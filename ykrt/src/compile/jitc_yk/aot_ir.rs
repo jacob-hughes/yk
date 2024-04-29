@@ -346,6 +346,28 @@ impl AotIRDisplay for Operand {
     }
 }
 
+#[deku_derive(DekuRead)]
+#[derive(Debug)]
+pub(crate) struct DeoptSafepoint {
+    pub(crate) id: Operand,
+    #[deku(temp)]
+    num_lives: u32,
+    #[deku(count = "num_lives")]
+    pub(crate) lives: Vec<Operand>,
+}
+
+impl AotIRDisplay for DeoptSafepoint {
+    fn to_string(&self, m: &Module) -> String {
+        let lives_s = self
+            .lives
+            .iter()
+            .map(|a| a.to_string(m))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[safepoint: {}, ({})]", self.id.to_string(m), lives_s)
+    }
+}
+
 /// An instruction.
 ///
 /// An instruction is conceptually an [Opcode] and a list of [Operand]s. The semantics of the
@@ -380,6 +402,10 @@ pub(crate) enum Instruction {
         num_args: u32,
         #[deku(count = "num_args")]
         args: Vec<Operand>,
+        #[deku(temp)]
+        has_safepoint: u8,
+        #[deku(cond = "*has_safepoint != 0", default = "None")]
+        safepoint: Option<DeoptSafepoint>,
     },
     #[deku(id = "5")]
     Br {
@@ -391,6 +417,7 @@ pub(crate) enum Instruction {
         cond: Operand,
         true_bb: BBlockIdx,
         false_bb: BBlockIdx,
+        safepoint: DeoptSafepoint,
     },
     #[deku(id = "7")]
     ICmp {
@@ -434,16 +461,6 @@ pub(crate) enum Instruction {
         dest_type_idx: TypeIdx,
     },
     #[deku(id = "13")]
-    DeoptSafepoint {
-        id: Operand,
-        // FIXME: this is never used, do we need to serialize this?
-        num_shadow_bytes: Operand,
-        #[deku(temp)]
-        num_lives: u32,
-        #[deku(count = "num_lives")]
-        lives: Vec<Operand>,
-    },
-    #[deku(id = "14")]
     Switch {
         test_val: Operand,
         default_dest: BBlockIdx,
@@ -509,7 +526,6 @@ impl Instruction {
             }
             Self::Store { .. } => None,
             Self::Cast { dest_type_idx, .. } => Some(m.type_(*dest_type_idx)),
-            Self::DeoptSafepoint { .. } => None,
             Self::Switch { .. } => None,
             Self::Unimplemented(_) => None,
             _ => todo!("{:?}", self),
@@ -527,7 +543,7 @@ impl Instruction {
     /// being passed to it. Otherwise return None.
     pub(crate) fn control_point_call_trace_inputs(&self, aot_mod: &Module) -> Option<&Operand> {
         match self {
-            Self::Call { callee, args } => {
+            Self::Call { callee, args, .. } => {
                 if aot_mod.func(*callee).name == CONTROL_POINT_NAME {
                     let arg = &args[CTRL_POINT_ARGIDX_INPUTS];
                     // It should be a pointer (to a struct, but we can't check that).
@@ -541,10 +557,11 @@ impl Instruction {
         }
     }
 
-    pub(crate) fn is_safepoint(&self) -> bool {
+    pub(crate) fn safepoint(&self) -> Option<&DeoptSafepoint> {
         match self {
-            Self::DeoptSafepoint { .. } => true,
-            _ => false,
+            Self::Call { safepoint, .. } => safepoint.as_ref(),
+            Self::CondBr { ref safepoint, .. } => Some(safepoint),
+            _ => None,
         }
     }
 
@@ -585,23 +602,37 @@ impl AotIRDisplay for Instruction {
                 rhs.to_string(m)
             )),
             Self::Br { succ } => ret.push_str(&format!("br bb{}", usize::from(*succ))),
-            Self::Call { callee, args } => {
+            Self::Call {
+                callee,
+                args,
+                safepoint,
+            } => {
                 let args_s = args
                     .iter()
                     .map(|a| a.to_string(m))
                     .collect::<Vec<_>>()
                     .join(", ");
-                ret.push_str(&format!("call {}({})", m.func(*callee).name(), args_s,));
+                let safepoint_s = safepoint
+                    .as_ref()
+                    .map_or("".to_string(), |sp| format!(" {}", sp.to_string(m)));
+                ret.push_str(&format!(
+                    "call {}({}){}",
+                    m.func(*callee).name(),
+                    args_s,
+                    safepoint_s
+                ));
             }
             Self::CondBr {
                 cond,
                 true_bb,
                 false_bb,
+                safepoint,
             } => ret.push_str(&format!(
-                "condbr {}, bb{}, bb{}",
+                "condbr {}, bb{}, bb{} {}",
                 cond.to_string(m),
                 usize::from(*true_bb),
-                usize::from(*false_bb)
+                usize::from(*false_bb),
+                safepoint.to_string(m)
             )),
             Self::ICmp { lhs, pred, rhs, .. } => ret.push_str(&format!(
                 "icmp {}, {}, {}",
@@ -637,14 +668,6 @@ impl AotIRDisplay for Instruction {
                 val.to_string(m),
                 m.types[*dest_type_idx].to_string(m)
             )),
-            Self::DeoptSafepoint { id, lives, .. } => {
-                let args_s = lives
-                    .iter()
-                    .map(|a| a.to_string(m))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ret.push_str(&format!("safepoint {}, [{}]", id.to_string(m), args_s,));
-            }
             Self::Switch {
                 test_val,
                 default_dest,
