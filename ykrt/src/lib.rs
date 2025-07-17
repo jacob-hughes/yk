@@ -19,6 +19,11 @@ pub(crate) mod stack;
 pub(crate) mod thread_intercept;
 pub mod trace;
 
+pub use thread_intercept::register_shadow_stack;
+pub use thread_intercept::yk_foreach_shadowstack;
+pub use thread_intercept::yk_init;
+pub use thread_intercept::yk_pthread_create;
+
 pub use self::location::Location;
 pub use self::mt::{HotThreshold, MTThread, MT};
 use std::ffi::{c_char, CStr};
